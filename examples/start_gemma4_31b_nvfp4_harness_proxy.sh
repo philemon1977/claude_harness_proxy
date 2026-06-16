@@ -59,26 +59,70 @@ detect_python() {
   fi
 }
 
-# Detect common model directories under /home/qiba/ai/models/
-detect_model_path() {
-  local model_name="$1"
-  local search_dirs=(
+# Find model directories via filesystem search, let user pick if multiple
+find_models() {
+  local keyword="$1"
+  local search_roots=(
     /home/qiba/ai/models
     /models
     /opt/models
     "${HOME}/models"
   )
-  for base in "${search_dirs[@]}"; do
+  local results=()
+  local found_paths=""
+
+  for base in "${search_roots[@]}"; do
     if [ -d "$base" ]; then
-      for entry in "$base"/*"${model_name}"*; do
-        if [ -d "$entry" ]; then
-          echo "$entry"
-          return 0
-        fi
-      done
+      found_paths=$(find "$base" -maxdepth 3 -type d -name "*${keyword}*" 2>/dev/null | sort)
+      if [ -n "$found_paths" ]; then
+        while IFS= read -r p; do
+          results+=("$p")
+        done <<< "$found_paths"
+      fi
     fi
   done
+
+  echo "${results[@]+"${results[@]}"}"
+}
+
+# Prompt user to pick from found models, or type a path
+pick_model() {
+  local keyword="$1"
+  local fallback="$2"
+  local candidates
+  candidates=$(find_models "$keyword")
+
+  if [ -z "$candidates" ]; then
+    echo "$fallback"
+    return
+  fi
+
+  local arr=()
+  while IFS= read -r line; do
+    [ -n "$line" ] && arr+=("$line")
+  done <<< "$candidates"
+
+  if [ "${#arr[@]}" -eq 1 ]; then
+    echo "${arr[0]}"
+    return
+  fi
+
+  echo "  Found ${#arr[@]} matching model directories:"
   echo ""
+  for i in "${!arr[@]}"; do
+    echo "    $((i+1))) ${arr[$i]}"
+  done
+  echo ""
+  local choice
+  read -rp "Select model directory (1-${#arr[@]}, or type custom path): " choice
+
+  if [[ "$choice" =~ ^[0-9]+$ ]] && [ "$choice" -ge 1 ] && [ "$choice" -le "${#arr[@]}" ]; then
+    echo "${arr[$((choice-1))]}"
+  elif [ -n "$choice" ] && [ -d "$choice" ]; then
+    echo "$choice"
+  else
+    echo "${arr[0]}"
+  fi
 }
 
 # ──────────────────────────────────────────────────────────────────────────
@@ -106,12 +150,9 @@ GPU_DEVICE=$(read_config "GPU device (CUDA_VISIBLE_DEVICES)" "$DEFAULT_GPU")
 DEFAULT_CUDA_ARCH=$(detect_cuda_arch)
 CUDA_ARCH=$(read_config "CUDA architecture (e.g. 12.0f)" "$DEFAULT_CUDA_ARCH")
 
-# Model path
-DEFAULT_MODEL=$(detect_model_path "Gemma-4-31B" 2>/dev/null || echo "")
-if [ -z "$DEFAULT_MODEL" ]; then
-  DEFAULT_MODEL="/home/qiba/ai/models/Gemma-4-31B-IT-NVFP4"
-fi
-MODEL_PATH=$(read_config "Model path" "$DEFAULT_MODEL")
+# Model path — search filesystem, offer selection if multiple matches
+PICKED_MODEL=$(pick_model "Gemma-4-31B" "/home/qiba/ai/models/Gemma-4-31B-IT-NVFP4")
+MODEL_PATH=$(read_config "Model path" "$PICKED_MODEL")
 
 # Ports
 VLLM_PORT=$(read_config "vLLM port" "${VLLM_PORT:-8100}")
