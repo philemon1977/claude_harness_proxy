@@ -10,6 +10,62 @@
 
 ---
 
+## Why This Exists
+
+> "Open-source models are bad at tool calling" — almost always a **harness (framework)** problem, not a model capability problem.
+
+With only a few tiny framework adjustments, the author enabled **DeepSeek V4 Pro** to beat **Claude Opus 4.7** in 6 out of 10 internal tool-call benchmarks — without modifying the model itself.
+
+### Background
+
+After two days of analyzing billions of token logs from CommandCode (an open-source AI CLI tool), the author discovered that **DeepSeek Flash** failed even the simplest code-review tasks — every shell command invocation or file read returned raw Zod validation errors that the model could never self-repair. A thin **tool input repair layer** solved the problem entirely.
+
+### Key Findings
+
+#### Failure Modes Are Highly Fixed and Limited
+
+Mainstream open-source models (DeepSeek family, GLM, Qwen) consistently make only **four types of repeated errors** during tool calls:
+
+1. Passing `null` for optional fields instead of omitting them
+2. Writing JSON arrays as strings (`"[\"a\",\"b\"]"` instead of `["a","b"]`)
+3. Wrapping single parameters in `{}` when the schema expects an array
+4. Sending a plain string where an array is expected (`"foo"` instead of `["foo"]`)
+
+Four repair functions, each 30–100 lines, resolve **90% of tool-call failures** when executed in the correct order.
+
+#### The Most Subtle Error: "Training Leakage"
+
+DeepSeek Flash sometimes writes file paths as Markdown auto-links:
+`filePath: "[notes.md](notes.md)"` — causing the tool to attempt creating a file with literal brackets. This is **not hallucination** — it's the model rewarded for auto-linking during chat training, leaking into tool-call scenarios.
+
+**Fix:** Two lines of regex targeting the degenerate case where link text equals the URL, without breaking legitimate Markdown links.
+
+#### Inverted Validation Flow
+
+The original approach — "pre-process then validate" — would corrupt file content that happened to be valid JSON, causing silent data damage.
+
+**Solution: Validate first, repair only on failure.**
+
+1. Try raw input — if valid, execute immediately without modification
+2. On validation failure, attempt repairs in order, guided by the error path
+3. Log success or return a model-readable retry hint
+
+This lets the validator pinpoint the broken field, spend repair cost only where needed, and provides per-model per-tool error-rate telemetry for free.
+
+#### Shape Errors vs. Relation Errors
+
+The four repairs above handle **shape errors** (wrong types/structure). **Relation errors** require different treatment: e.g., `readFile` expects `offset` and `limit` as a pair, but the model often sends only one.
+
+**Fix:** Extend tool semantics — `limit` without `offset` → auto-fill `offset=0`; `offset` without `limit` → auto-fill `limit=2000` (industry default). The response explicitly states what was defaulted, allowing the model to self-correct in the next turn.
+
+### The Conclusion
+
+Many phenomena labeled "model capability gaps" are fundamentally **contract design problems**. Commercial models (Claude Opus) have seen vast API contract variations during pre-training, so they tolerate lenient inputs — a cost they "silently absorb." Open-source models, unfamiliar with so many contracts, fail under strict schemas and get mislabeled as "incapable."
+
+**A harness's core role is to mediate between a model's output distribution and a tool's input distribution.** The author never modified DeepSeek — made the contract tolerant where needed, and achieved Opus 4.7 surpassal.
+
+---
+
 ## Overview
 
 Claude Harness Proxy sits between Claude Code CLI (or any LLM client) and upstream inference backends (vLLM, LiteLLM, llama.cpp). It intercepts API requests and responses, transparently applying:
