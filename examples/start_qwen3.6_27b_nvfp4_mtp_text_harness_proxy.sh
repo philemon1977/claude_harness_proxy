@@ -1,22 +1,152 @@
 #!/bin/bash
 # Example: Qwen3.6-27B NVFP4 MTP + Harness Proxy
 # Description: vLLM -> Harness Proxy chain
-# Modify the variables below for your environment before running.
+#
+# This script auto-discovers system configuration and prompts for any
+# missing values. Press Enter to accept defaults shown in [brackets].
 set -euo pipefail
 
-# ── 基础路径与环境 ────────────────────────────────────────────────────────────────
-# 修改为你的 vLLM Python 环境路径
-VLLM_PYTHON="${VLLM_PYTHON:-/home/qiba/miniconda/envs/vllm022_py311/bin/python}"
-HARNESS_PYTHON="${VLLM_PYTHON}"
+# ──────────────────────────────────────────────────────────────────────────
+# Helper: read a value from stdin, with a default
+# ──────────────────────────────────────────────────────────────────────────
+read_config() {
+  local prompt="$1"
+  local default="$2"
+  if [ -n "$default" ]; then
+    read -rp "$prompt [$default] " val
+    echo "${val:-$default}"
+  else
+    read -rp "$prompt " val
+    echo "$val"
+  fi
+}
 
-# 修改为你的 GPU 配置
-GPU_DEVICE="${GPU_DEVICE:-0}"
+# ──────────────────────────────────────────────────────────────────────────
+# Auto-discovery
+# ──────────────────────────────────────────────────────────────────────────
 
-# ── 端口定义 ──────────────────────────────────────────────────────────────────
-VLLM_PORT="${VLLM_PORT:-8200}"
-HARNESS_PORT="${HARNESS_PORT:-9200}"
+# Detect GPU CUDA compute capability
+detect_cuda_arch() {
+  local cc
+  cc=$(nvidia-smi --query-gpu=compute_cap --format=csv,noheader 2>/dev/null | head -1 | tr -d ' ')
+  if [ -n "$cc" ]; then
+    echo "${cc}f"
+  else
+    echo ""
+  fi
+}
 
-# ── 环境变量 ──────────────────────────────────────────────────────────────────
+# Find best vLLM-compatible Python from conda environments
+detect_python() {
+  local candidates=(
+    /home/qiba/miniconda/envs/vllm022_py311/bin/python
+    /home/qiba/miniconda/envs/vllm021_py311/bin/python
+    /home/qiba/miniconda/envs/vllm_nightly_py311/bin/python
+    /home/qiba/miniconda/envs/vllm022_py311/bin/python
+  )
+  for p in "${candidates[@]}"; do
+    if [ -x "$p" ]; then
+      echo "$p"
+      return 0
+    fi
+  done
+  if command -v python3 &>/dev/null; then
+    echo "$(command -v python3)"
+  else
+    echo ""
+  fi
+}
+
+# Detect common model directories
+detect_model_path() {
+  local model_name="$1"
+  local search_dirs=(
+    /home/qiba/ai/models
+    /models
+    /opt/models
+    "${HOME}/models"
+  )
+  for base in "${search_dirs[@]}"; do
+    if [ -d "$base" ]; then
+      for entry in "$base"/*"${model_name}"*; do
+        if [ -d "$entry" ]; then
+          echo "$entry"
+          return 0
+        fi
+      done
+    fi
+  done
+  echo ""
+}
+
+# ──────────────────────────────────────────────────────────────────────────
+# Configuration prompts
+# ──────────────────────────────────────────────────────────────────────────
+
+echo "============================================================"
+echo "  Qwen3.6-27B NVFP4 MTP + Harness Proxy Configuration"
+echo "============================================================"
+echo ""
+
+# Python path
+DEFAULT_PYTHON=$(detect_python)
+VLLM_PYTHON=$(read_config "Python path" "$DEFAULT_PYTHON")
+HARNESS_PYTHON="$VLLM_PYTHON"
+if [ ! -x "$VLLM_PYTHON" ]; then
+  echo "⚠ Warning: Python not found at $VLLM_PYTHON — proxy may fail to start."
+fi
+
+# GPU
+DEFAULT_GPU="${CUDA_VISIBLE_DEVICES:-0}"
+GPU_DEVICE=$(read_config "GPU device (CUDA_VISIBLE_DEVICES)" "$DEFAULT_GPU")
+
+# CUDA architecture
+DEFAULT_CUDA_ARCH=$(detect_cuda_arch)
+CUDA_ARCH=$(read_config "CUDA architecture (e.g. 12.0f)" "$DEFAULT_CUDA_ARCH")
+
+# Model path
+DEFAULT_MODEL=$(detect_model_path "Qwen3.6-27B" 2>/dev/null || echo "")
+if [ -z "$DEFAULT_MODEL" ]; then
+  DEFAULT_MODEL="/home/qiba/ai/models/Qwen3.6-27B-NVFP4-MTP-TEXT"
+fi
+MODEL_PATH=$(read_config "Model path" "$DEFAULT_MODEL")
+
+# Ports
+VLLM_PORT=$(read_config "vLLM port" "${VLLM_PORT:-8200}")
+HARNESS_PORT=$(read_config "Harness proxy port" "${HARNESS_PORT:-9200}")
+
+# Memory / performance
+GPU_MEM_UTIL=$(read_config "GPU memory utilization (0.0-1.0)" "${GPU_MEM_UTIL:-0.82}")
+MAX_MODEL_LEN=$(read_config "Max model length" "${MAX_MODEL_LEN:-524288}")
+MAX_NUM_SEQS=$(read_config "Max number of sequences" "${MAX_NUM_SEQS:-4}")
+MAX_BATCHED_TOKENS=$(read_config "Max batched tokens" "${MAX_BATCHED_TOKENS:-32768}")
+BLOCK_SIZE=$(read_config "Block size" "${BLOCK_SIZE:-32}")
+MTP_TOKENS=$(read_config "MTP speculative tokens" "${MTP_TOKENS:-4}")
+
+LOG_FILE="/tmp/vllm-harness-qwen36-${VLLM_PORT}.log"
+
+echo ""
+echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+echo "  Configuration Summary"
+echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+echo "  Python:          $VLLM_PYTHON"
+echo "  GPU:             $GPU_DEVICE"
+echo "  CUDA Arch:       $CUDA_ARCH"
+echo "  Model:           $MODEL_PATH"
+echo "  vLLM Port:       $VLLM_PORT"
+echo "  Harness Port:    $HARNESS_PORT"
+echo "  GPU Mem Util:    $GPU_MEM_UTIL"
+echo "  Max Model Len:  $MAX_MODEL_LEN"
+echo "  MTP Tokens:     $MTP_TOKENS"
+echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+echo ""
+echo "Press Ctrl+C to cancel, or Enter to continue..."
+read -rp "" _
+
+# ──────────────────────────────────────────────────────────────────────────
+# Export environment
+# ──────────────────────────────────────────────────────────────────────────
+
 export CUDA_VISIBLE_DEVICES="${GPU_DEVICE}"
 export PYTORCH_CUDA_ALLOC_CONF="expandable_segments:True,garbage_collection_threshold:0.8,max_split_size_mb:512"
 export TORCH_CUDA_ALLOW_TF32=0
@@ -32,22 +162,11 @@ export USE_LIBUV="0"
 export TORCH_NCCL_ASYNC_ERROR_HANDLING="0"
 export NCCL_ASYNC_ERROR_HANDLING="0"
 export PYTHONFAULTHANDLER="1"
-export FLASHINFER_CUDA_ARCH_LIST=12.0f
+export FLASHINFER_CUDA_ARCH_LIST="${CUDA_ARCH}"
 export FLASHINFER_CACHE_DIR="${HOME}/.cache/flashinfer"
 export VLLM_TORCH_COMPILE_CACHE_DIR="${HOME}/.cache/vllm/torch_compile_cache"
-# ──────────────────────────────────────────────────────────────────────────────
 
-# ── 模型配置 ──────────────────────────────────────────────────────────────────
-# 修改为你的模型路径
-MODEL_PATH="${MODEL_PATH:-/home/qiba/ai/models/Qwen3.6-27B-NVFP4-MTP-TEXT}"
-LOG_FILE="/tmp/vllm-harness-qwen36-${VLLM_PORT}.log"
-GPU_MEM_UTIL="${GPU_MEM_UTIL:-0.82}"
-MAX_MODEL_LEN=524288
-MAX_NUM_SEQS=4
-MAX_BATCHED_TOKENS=32768
-BLOCK_SIZE=32
-MTP_TOKENS=4
-
+# Port check
 if ss -tlnp 2>/dev/null | grep -q ":${VLLM_PORT} "; then
   echo "错误：vLLM 端口 ${VLLM_PORT} 已被占用"; exit 1
 fi
@@ -108,7 +227,6 @@ echo "vLLM Engine is UP!"
 
 # 3. 启动 Claude Harness Proxy
 echo "Step 2: Starting Claude Harness Proxy on port ${HARNESS_PORT}..."
-# 只杀同端口的旧 proxy 实例，不影响其他端口
 ss -tlnp 2>/dev/null | grep -q ":${HARNESS_PORT} " && \
   fuser -k ${HARNESS_PORT}/tcp 2>/dev/null || true
 sleep 1
@@ -117,7 +235,6 @@ export UPSTREAM_URL="http://localhost:${VLLM_PORT}"
 export PROXY_PORT=${HARNESS_PORT}
 export PROXY_HOST="0.0.0.0"
 
-# 获取脚本所在目录，定位 claude_harness_proxy.py
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 PROXY_SCRIPT="${SCRIPT_DIR}/../claude_harness_proxy.py"
 
@@ -129,8 +246,9 @@ until curl -s http://localhost:${HARNESS_PORT}/health > /dev/null; do
 done
 echo "Harness Proxy is UP!"
 
+echo ""
 echo "=============================================================================="
-echo "Qwen3.6-27B NVFP4 MTP + Harness Proxy deployed!"
+echo "  Qwen3.6-27B NVFP4 MTP + Harness Proxy deployed!"
 echo "  vLLM (${VLLM_PORT}) -> Harness (${HARNESS_PORT})"
 echo "  Final Endpoint: http://localhost:${HARNESS_PORT}/v1"
 echo "  Logs: ${LOG_FILE}, /tmp/claude_harness_proxy.log"
